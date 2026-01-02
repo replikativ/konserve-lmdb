@@ -3,15 +3,24 @@ version: 2.1
 orbs:
   tools: replikativ/clj-tools@0
 
+executors:
+  java22:
+    docker:
+      - image: cimg/openjdk:22.0
+    working_directory: ~/repo
+
 jobs:
   unittest:
-    executor: tools/clojurecli
+    executor: java22
     steps:
       - attach_workspace:
           at: /home/circleci
       - run:
-          name: Install liblmdb
+          name: Install Clojure CLI and liblmdb
           command: |
+            curl -L -O https://github.com/clojure/brew-install/releases/latest/download/linux-install.sh
+            chmod +x linux-install.sh
+            sudo ./linux-install.sh
             sudo apt-get update
             sudo apt-get install -y liblmdb0
       - run:
