@@ -1,0 +1,23 @@
+# Clojure
+.cpcache/
+.nrepl-port
+target/
+*.jar
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.calva/
+.lsp/
+.clj-kondo/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# JVM crash logs
+hs_err_pid*.log
+
+# Test artifacts
+/tmp/
