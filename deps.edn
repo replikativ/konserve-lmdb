@@ -31,5 +31,6 @@
           :main-opts ["-m" "konserve-lmdb.run-benchmark"]}
 
   :build {:deps {io.github.clojure/tools.build {:mvn/version "0.10.5"}
-                 slipset/deps-deploy {:mvn/version "0.2.2"}}
+                 slipset/deps-deploy {:mvn/version "0.2.2"}
+                 io.github.borkdude/gh-release-artifact {:git/sha "b946558225a7839f6a0f644834e838e190dc2262"}}
           :ns-default build}}}
