@@ -22,7 +22,11 @@
                 :src-dirs ["src"]
                 :scm {:url "https://github.com/replikativ/konserve-lmdb"
                       :connection "scm:git:git://github.com/replikativ/konserve-lmdb.git"
-                      :developerConnection "scm:git:ssh://git@github.com/replikativ/konserve-lmdb.git"}})
+                      :developerConnection "scm:git:ssh://git@github.com/replikativ/konserve-lmdb.git"}
+                :pom-data [[:licenses
+                            [:license
+                             [:name "Eclipse Public License 2.0"]
+                             [:url "https://www.eclipse.org/legal/epl-2.0/"]]]]})
   (b/copy-dir {:src-dirs ["src"]
                :target-dir class-dir})
   (b/jar {:class-dir class-dir
