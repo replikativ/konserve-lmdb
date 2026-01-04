@@ -8,6 +8,7 @@
   (:refer-clojure :exclude [get])
   (:require [konserve.protocols :as p :refer [PLockFreeStore]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
+            [konserve.store :as store]
             [konserve-lmdb.native :as n]
             [konserve-lmdb.buffer :as buf]
             [superv.async :refer [go-try-]])
@@ -388,3 +389,28 @@
       (doseq [^File f (.listFiles dir)]
         (.delete f))
       (.delete dir))))
+
+;; =============================================================================
+;; Multimethod Registration for konserve.store dispatch
+;; =============================================================================
+
+(defmethod store/connect-store :lmdb
+  [{:keys [path map-size flags type-handlers] :as config}]
+  ;; Build options for connect-store from config
+  (let [opts (cond-> {}
+               map-size (assoc :map-size map-size)
+               flags (assoc :flags flags)
+               type-handlers (assoc :type-handlers type-handlers))]
+    (apply connect-store path (flatten (seq opts)))))
+
+(defmethod store/empty-store :lmdb
+  [config]
+  (store/connect-store config))
+
+(defmethod store/delete-store :lmdb
+  [{:keys [path]}]
+  (delete-store path))
+
+(defmethod store/release-store :lmdb
+  [_config store]
+  (release-store store))
