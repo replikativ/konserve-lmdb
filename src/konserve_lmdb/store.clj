@@ -395,42 +395,48 @@
 ;; =============================================================================
 
 (defmethod store/connect-store :lmdb
-  [{:keys [path map-size flags type-handlers] :as config}]
-  ;; Check if store exists
-  (when-not (.exists (clojure.java.io/file path))
-    (throw (ex-info (str "LMDB store does not exist at path: " path)
-                    {:path path :config config})))
-  ;; Build options for connect-store from config
-  (let [opts (cond-> {}
-               map-size (assoc :map-size map-size)
-               flags (assoc :flags flags)
-               type-handlers (assoc :type-handlers type-handlers))]
-    (apply connect-store path (flatten (seq opts)))))
+  [{:keys [path map-size flags type-handlers] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               ;; Check if store exists
+               (when-not (.exists (clojure.java.io/file path))
+                 (throw (ex-info (str "LMDB store does not exist at path: " path)
+                                 {:path path :config config})))
+               ;; Build options for connect-store from config
+               (let [store-opts (cond-> {}
+                                  map-size (assoc :map-size map-size)
+                                  flags (assoc :flags flags)
+                                  type-handlers (assoc :type-handlers type-handlers))]
+                 (apply connect-store path (flatten (seq store-opts)))))))
 
 (defmethod store/create-store :lmdb
-  [{:keys [path map-size flags type-handlers] :as config}]
-  ;; Check if store already exists
-  (when (.exists (clojure.java.io/file path))
-    (throw (ex-info (str "LMDB store already exists at path: " path)
-                    {:path path :config config})))
-  ;; Build options and create store
-  (let [opts (cond-> {}
-               map-size (assoc :map-size map-size)
-               flags (assoc :flags flags)
-               type-handlers (assoc :type-handlers type-handlers))]
-    (apply connect-store path (flatten (seq opts)))))
+  [{:keys [path map-size flags type-handlers] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               ;; Check if store already exists
+               (when (.exists (clojure.java.io/file path))
+                 (throw (ex-info (str "LMDB store already exists at path: " path)
+                                 {:path path :config config})))
+               ;; Build options and create store
+               (let [store-opts (cond-> {}
+                                  map-size (assoc :map-size map-size)
+                                  flags (assoc :flags flags)
+                                  type-handlers (assoc :type-handlers type-handlers))]
+                 (apply connect-store path (flatten (seq store-opts)))))))
 
 (defmethod store/store-exists? :lmdb
-  [{:keys [path opts]}]
-  ;; LMDB store exists if the directory exists
-  (let [opts (or opts {:sync? true})
-        exists (.exists (clojure.java.io/file path))]
-    (if (:sync? opts) exists (clojure.core.async/go exists))))
+  [{:keys [path] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               ;; LMDB store exists if the directory exists
+               (.exists (clojure.java.io/file path)))))
 
 (defmethod store/delete-store :lmdb
-  [{:keys [path]}]
-  (delete-store path))
+  [{:keys [path] :as config} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (delete-store path))))
 
 (defmethod store/release-store :lmdb
-  [_config store]
+  [_config store _opts]
   (release-store store))
