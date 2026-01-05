@@ -396,6 +396,10 @@
 
 (defmethod store/connect-store :lmdb
   [{:keys [path map-size flags type-handlers] :as config}]
+  ;; Check if store exists
+  (when-not (.exists (clojure.java.io/file path))
+    (throw (ex-info (str "LMDB store does not exist at path: " path)
+                    {:path path :config config})))
   ;; Build options for connect-store from config
   (let [opts (cond-> {}
                map-size (assoc :map-size map-size)
@@ -404,9 +408,17 @@
     (apply connect-store path (flatten (seq opts)))))
 
 (defmethod store/create-store :lmdb
-  [config]
-  ;; LMDB has no creation step - same as connect
-  (store/connect-store config))
+  [{:keys [path map-size flags type-handlers] :as config}]
+  ;; Check if store already exists
+  (when (.exists (clojure.java.io/file path))
+    (throw (ex-info (str "LMDB store already exists at path: " path)
+                    {:path path :config config})))
+  ;; Build options and create store
+  (let [opts (cond-> {}
+               map-size (assoc :map-size map-size)
+               flags (assoc :flags flags)
+               type-handlers (assoc :type-handlers type-handlers))]
+    (apply connect-store path (flatten (seq opts)))))
 
 (defmethod store/store-exists? :lmdb
   [{:keys [path opts]}]
