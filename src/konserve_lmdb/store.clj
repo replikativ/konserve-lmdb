@@ -403,9 +403,17 @@
                type-handlers (assoc :type-handlers type-handlers))]
     (apply connect-store path (flatten (seq opts)))))
 
-(defmethod store/empty-store :lmdb
+(defmethod store/create-store :lmdb
   [config]
+  ;; LMDB has no creation step - same as connect
   (store/connect-store config))
+
+(defmethod store/store-exists? :lmdb
+  [{:keys [path opts]}]
+  ;; LMDB store exists if the directory exists
+  (let [opts (or opts {:sync? true})
+        exists (.exists (clojure.java.io/file path))]
+    (if (:sync? opts) exists (clojure.core.async/go exists))))
 
 (defmethod store/delete-store :lmdb
   [{:keys [path]}]
