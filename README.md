@@ -75,11 +75,22 @@ Add to your dependencies:
 ### Konserve API (Full Compatibility)
 
 ```clojure
-(require '[konserve-lmdb.store :as lmdb]
+(require '[konserve-lmdb.store]  ;; Registers the :lmdb backend
          '[konserve.core :as k])
 
-;; Create a store
-(def store (lmdb/connect-store "/tmp/my-store"))
+(def lmdb-config
+  {:backend :lmdb
+   :path "/tmp/my-store"
+   :opts {:sync? true}})
+
+;; Create a new store (same as connect for LMDB - no creation step)
+(def store (k/create-store lmdb-config))
+
+;; Or connect to existing store
+;; (def store (k/connect-store lmdb-config))
+
+;; Check if store exists
+(k/store-exists? lmdb-config) ;; => true
 
 ;; Standard konserve operations
 (k/assoc store :user {:name "Alice" :age 30} {:sync? true})
@@ -112,7 +123,7 @@ Add to your dependencies:
         {:sync? true})
 
 ;; Clean up
-(lmdb/release-store store)
+(k/delete-store lmdb-config)
 ```
 
 ### Direct API (Maximum Performance)
@@ -143,13 +154,33 @@ For performance-critical code, use the Direct API which bypasses konserve's meta
 
 ### Configuration Options
 
-```clojure
-(require '[konserve-lmdb.native :as n])
+**Multimethod API**:
 
-(lmdb/connect-store "/tmp/my-store"
-  :map-size (* 1024 1024 1024)   ; LMDB map size (default: 1GB)
-  :flags n/MDB_NORDAHEAD         ; Environment flags (see below)
-  :type-handlers registry)       ; Custom type handlers for serialization
+```clojure
+(require '[konserve-lmdb.native :as n]
+         '[konserve.core :as k])
+
+(def config
+  {:backend :lmdb
+   :path "/tmp/my-store"
+   :map-size (* 1024 1024 1024)   ; LMDB map size (default: 1GB)
+   :flags n/MDB_NORDAHEAD         ; Environment flags (see below)
+   :type-handlers registry        ; Custom type handlers for serialization
+   :opts {:sync? true}})
+
+(def store (k/create-store config))
+```
+
+**Direct API**:
+
+```clojure
+(require '[konserve-lmdb.store :as lmdb]
+         '[konserve-lmdb.native :as n])
+
+(def store (lmdb/connect-store "/tmp/my-store"
+             :map-size (* 1024 1024 1024)
+             :flags n/MDB_NORDAHEAD
+             :type-handlers registry))
 ```
 
 **Environment Flags:**
@@ -268,9 +299,16 @@ clojure -M:bench
 
 ### Store Management
 
-- `(connect-store path & opts)` - Create/open an LMDB store
-- `(release-store store)` - Close the store
-- `(delete-store path)` - Delete store and all data
+**Multimethod API (konserve.core)**:
+- `(k/create-store config)` - Create/open an LMDB store via multimethod dispatch
+- `(k/connect-store config)` - Connect to existing LMDB store (same as create for LMDB)
+- `(k/store-exists? config)` - Check if store directory exists
+- `(k/delete-store config)` - Delete store and all data
+
+**Direct API (konserve-lmdb.store)**:
+- `(lmdb/connect-store path & opts)` - Create/open an LMDB store directly
+- `(lmdb/release-store store)` - Close the store
+- `(lmdb/delete-store path)` - Delete store and all data
 
 ### Direct API (High Performance)
 
