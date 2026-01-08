@@ -78,53 +78,23 @@ Add to your dependencies:
 (require '[konserve-lmdb.store]  ;; Registers the :lmdb backend
          '[konserve.core :as k])
 
-(def lmdb-config
+(def config
   {:backend :lmdb
    :path "/tmp/my-store"
-   :opts {:sync? true}})
+   :id #uuid "550e8400-e29b-41d4-a716-446655440000"
+   ;; Optional:
+   :map-size (* 1024 1024 1024)  ;; Default: 1GB
+   :flags 0})
 
-;; Create a new store (same as connect for LMDB - no creation step)
-(def store (k/create-store lmdb-config))
-
-;; Or connect to existing store
-;; (def store (k/connect-store lmdb-config))
-
-;; Check if store exists
-(k/store-exists? lmdb-config) ;; => true
-
-;; Standard konserve operations
-(k/assoc store :user {:name "Alice" :age 30} {:sync? true})
-(k/get store :user nil {:sync? true})
-;; => {:name "Alice", :age 30}
-
-(k/update-in store [:user :age] inc {:sync? true})
-(k/get-in store [:user :age] nil {:sync? true})
-;; => 31
-
-;; Multi-key atomic operations
-(k/multi-assoc store {:user1 {:name "Bob"}
-                      :user2 {:name "Carol"}}
-               {:sync? true})
-
-(k/multi-get store [:user1 :user2 :missing] {:sync? true})
-;; => {:user1 {:name "Bob"}, :user2 {:name "Carol"}}
-
-;; List all keys (metadata only - efficient for GC)
-(k/keys store {:sync? true})
-;; => [{:key :user, :type :edn, :last-write #inst "..."}
-;;     {:key :user1, :type :edn, :last-write #inst "..."}
-;;     ...]
-
-;; Binary data
-(k/bassoc store :image (byte-array [1 2 3 4]) {:sync? true})
-(k/bget store :image
-        (fn [{:keys [input-stream size]}]
-          (slurp input-stream))
-        {:sync? true})
-
-;; Clean up
-(k/delete-store lmdb-config)
+(def store (k/create-store config {:sync? true}))
 ```
+
+For API usage (assoc, get, multi-assoc, keys, etc.), see the [konserve documentation](https://github.com/replikativ/konserve).
+
+**Features**:
+- **Lock-free operations**: LMDB provides MVCC, no application-level locking needed
+- **Multi-key operations**: Atomic bulk operations supported
+- **Efficient key enumeration**: `keys` uses metadata-only decoding for GC efficiency
 
 ### Direct API (Maximum Performance)
 
@@ -154,33 +124,18 @@ For performance-critical code, use the Direct API which bypasses konserve's meta
 
 ### Configuration Options
 
-**Multimethod API**:
+**Environment Flags** (combine with `bit-or`):
 
 ```clojure
-(require '[konserve-lmdb.native :as n]
-         '[konserve.core :as k])
+(require '[konserve-lmdb.native :as n])
 
+;; Example with flags
 (def config
   {:backend :lmdb
    :path "/tmp/my-store"
-   :map-size (* 1024 1024 1024)   ; LMDB map size (default: 1GB)
-   :flags n/MDB_NORDAHEAD         ; Environment flags (see below)
-   :type-handlers registry        ; Custom type handlers for serialization
-   :opts {:sync? true}})
-
-(def store (k/create-store config))
-```
-
-**Direct API**:
-
-```clojure
-(require '[konserve-lmdb.store :as lmdb]
-         '[konserve-lmdb.native :as n])
-
-(def store (lmdb/connect-store "/tmp/my-store"
-             :map-size (* 1024 1024 1024)
-             :flags n/MDB_NORDAHEAD
-             :type-handlers registry))
+   :id #uuid "550e8400-e29b-41d4-a716-446655440000"
+   :flags (bit-or n/MDB_NORDAHEAD n/MDB_NOTLS)
+   :type-handlers registry})  ; Custom type handlers
 ```
 
 **Environment Flags:**

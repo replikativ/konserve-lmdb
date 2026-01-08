@@ -394,7 +394,7 @@
 ;; Multimethod Registration for konserve.store dispatch
 ;; =============================================================================
 
-(defmethod store/connect-store :lmdb
+(defmethod store/-connect-store :lmdb
   [{:keys [path map-size flags type-handlers] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
@@ -409,7 +409,7 @@
                                   type-handlers (assoc :type-handlers type-handlers))]
                  (apply connect-store path (flatten (seq store-opts)))))))
 
-(defmethod store/create-store :lmdb
+(defmethod store/-create-store :lmdb
   [{:keys [path map-size flags type-handlers] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
@@ -424,19 +424,19 @@
                                   type-handlers (assoc :type-handlers type-handlers))]
                  (apply connect-store path (flatten (seq store-opts)))))))
 
-(defmethod store/store-exists? :lmdb
+(defmethod store/-store-exists? :lmdb
   [{:keys [path] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                ;; LMDB store exists if the directory exists
                (.exists (clojure.java.io/file path)))))
 
-(defmethod store/delete-store :lmdb
+(defmethod store/-delete-store :lmdb
   [{:keys [path] :as config} opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (delete-store path))))
 
-(defmethod store/release-store :lmdb
+(defmethod store/-release-store :lmdb
   [_config store _opts]
   (release-store store))

@@ -1,12 +1,11 @@
 {:paths ["src"]
 
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
-        io.replikativ/konserve {:mvn/version "0.8.329"}
+        io.replikativ/konserve {:mvn/version "0.9.331"}
         org.suskalo/coffi {:mvn/version "1.0.615"}}
 
  :aliases
- {:dev {:override-deps {io.replikativ/konserve {:local/root "../konserve"}}
-        :extra-paths ["test" "bench"]
+ {:dev {:extra-paths ["test" "bench"]
         :extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
                      cider/cider-nrepl {:mvn/version "0.50.2"}}
         :jvm-opts ["--enable-native-access=ALL-UNNAMED"
