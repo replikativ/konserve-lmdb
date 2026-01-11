@@ -438,5 +438,7 @@
                (delete-store path))))
 
 (defmethod store/-release-store :lmdb
-  [_config store _opts]
-  (release-store store))
+  [_config store opts]
+  ;; Release and return proper async type
+  (release-store store)
+  (if (:sync? opts) nil (go-try- nil)))
