@@ -5,6 +5,8 @@
 [![CircleCI](https://circleci.com/gh/replikativ/konserve-lmdb.svg?style=shield)](https://circleci.com/gh/replikativ/konserve-lmdb)
 [![Last Commit](https://img.shields.io/github/last-commit/replikativ/konserve-lmdb/main.svg)](https://github.com/replikativ/konserve-lmdb/tree/main)
 
+**Note: This library is currently in beta. The API may change in future releases.**
+
 A high-performance [LMDB](https://www.symas.com/lmdb) backend for [konserve](https://github.com/replikativ/konserve) using Project Panama FFI (Java 22+).
 
 ## Features
