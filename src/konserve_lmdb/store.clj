@@ -6,7 +6,7 @@
    Storage format:
    - key (UTF-8 bytes) → {:meta {...} :value ...} (buffer encoded)"
   (:refer-clojure :exclude [get])
-  (:require [konserve.protocols :as p :refer [PLockFreeStore]]
+  (:require [konserve.protocols :as p :refer [PLockFreeStore PAssocSerializers]]
             [konserve.utils :refer [async+sync *default-sync-translation*]]
             [konserve.store :as store]
             [konserve-lmdb.native :as n]
@@ -247,6 +247,12 @@
   (-set-write-hooks! [this hooks-atom]
     (assoc this :write-hooks hooks-atom))
 
+  p/PAssocSerializers
+  (-assoc-serializers [this _serializers]
+    ;; LMDB uses buffer type handlers, not fressian serializers.
+    ;; Return this unchanged - serializers are ignored.
+    this)
+
   p/PLockFreeStore
   (-lock-free? [_] true))
 
@@ -298,10 +304,12 @@
   (let [dir (File. ^String path)]
     (when-not (.exists dir)
       (.mkdirs dir))
-    (let [env (n/open-env path :map-size map-size :flags flags)]
+    (let [env (n/open-env path :map-size map-size :flags flags)
+          ;; Create empty registry if none provided, so handlers can be added later
+          registry (or type-handlers (buf/create-handler-registry [] {}))]
       ;; locks is always nil - we use LMDB transactions for atomicity
       ;; konserve.core's maybe-go-locked will skip locking for lock-free stores
-      (->LMDBStore env path nil (atom {}) type-handlers))))
+      (->LMDBStore env path nil (atom {}) registry))))
 
 (defn release-store
   "Release/close the LMDB store."

@@ -1,7 +1,7 @@
 # konserve-lmdb
 
 [![Slack](https://img.shields.io/badge/slack-join_chat-brightgreen.svg)](https://clojurians.slack.com/archives/CB7GJAN0L)
-[![Clojars](https://img.shields.io/clojars/v/io.replikativ/konserve-lmdb.svg)](https://clojars.org/io.replikativ/konserve-lmdb)
+[![Clojars](https://img.shields.io/clojars/v/org.replikativ/konserve-lmdb.svg)](https://clojars.org/org.replikativ/konserve-lmdb)
 [![CircleCI](https://circleci.com/gh/replikativ/konserve-lmdb.svg?style=shield)](https://circleci.com/gh/replikativ/konserve-lmdb)
 [![Last Commit](https://img.shields.io/github/last-commit/replikativ/konserve-lmdb/main.svg)](https://github.com/replikativ/konserve-lmdb/tree/main)
 
@@ -70,7 +70,7 @@ export KONSERVE_LMDB_LIB=/path/to/liblmdb.so
 
 Add to your dependencies:
 
-[![Clojars Project](http://clojars.org/io.replikativ/konserve-lmdb/latest-version.svg)](http://clojars.org/io.replikativ/konserve-lmdb)
+[![Clojars Project](http://clojars.org/org.replikativ/konserve-lmdb/latest-version.svg)](http://clojars.org/org.replikativ/konserve-lmdb)
 
 ### Konserve API (Full Compatibility)
 

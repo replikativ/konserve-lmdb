@@ -6,7 +6,7 @@
   (:import [clojure.lang ExceptionInfo]))
 
 (def org "replikativ")
-(def lib 'io.replikativ/konserve-lmdb)
+(def lib 'org.replikativ/konserve-lmdb)
 (def current-commit (b/git-process {:git-args "rev-parse HEAD"}))
 (def version (format "0.1.%s" (b/git-count-revs nil)))
 (def class-dir "target/classes")

@@ -134,6 +134,20 @@
   (when registry
     (.get ^java.util.HashMap (:by-tag registry) (Integer/valueOf (int tag)))))
 
+(defn add-handler!
+  "Add a handler to an existing registry. Mutates the registry in place.
+   Returns the registry for chaining."
+  [^TypeHandlerRegistry registry handler]
+  (.put ^java.util.HashMap (:by-tag registry) (Integer/valueOf (int (type-tag handler))) handler)
+  (.put ^java.util.HashMap (:by-class registry) (type-class handler) handler)
+  registry)
+
+(defn registry-set-context!
+  "Set the context map on a registry. Mutates the registry.
+   Context is used to pass decode-time state like storage references."
+  [^TypeHandlerRegistry registry context]
+  (assoc registry :context context))
+
 ;;; Type Tags
 
 ;; Core types (0x00-0x0F)
