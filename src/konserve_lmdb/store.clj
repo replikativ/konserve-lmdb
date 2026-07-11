@@ -17,6 +17,25 @@
 
 (set! *warn-on-reflection* true)
 
+;;; ---------------------------------------------------------------------------
+;;; Post-connect type-handler injection
+;;;
+;;; The buffer codec resolves custom-type serialization from the store's
+;;; `:type-handlers` registry, read DYNAMICALLY on every op (see store-encode /
+;;; store-decode / make-buf-decode-fn). This protocol exposes a transparent,
+;;; composable way to attach/replace that registry AFTER connect — mirroring
+;;; konserve's `PAssocSerializers` for fressian stores. It lets a consumer (e.g.
+;;; datahike wiring an LMDB store as a tiered frontend) inject its own handlers
+;;; without owning the connect call or reaching into the record.
+;;; ---------------------------------------------------------------------------
+
+(defprotocol PAssocTypeHandlers
+  "Stores whose (buffer) serialization is driven by a swappable type-handler
+   registry."
+  (-assoc-type-handlers [this registry]
+    "Return a store that uses `registry` (a `konserve-lmdb.buffer` handler
+     registry) for value encode/decode. Pure w.r.t. the underlying env."))
+
 ;;; Key encoding - use our fast buffer encoder
 
 (defn- encode-key
@@ -250,11 +269,26 @@
   p/PAssocSerializers
   (-assoc-serializers [this _serializers]
     ;; LMDB uses buffer type handlers, not fressian serializers.
-    ;; Return this unchanged - serializers are ignored.
+    ;; Return this unchanged - serializers are ignored. NOTE: `assoc`-based so
+    ;; `:type-handlers`/`:storage-atom` survive a tiered store's serializer fan-out.
     this)
+
+  PAssocTypeHandlers
+  (-assoc-type-handlers [this registry]
+    ;; Buffer codec reads `:type-handlers` dynamically per op, so a plain assoc
+    ;; is a transparent, safe swap (no reconnect, env untouched).
+    (assoc this :type-handlers registry))
 
   p/PLockFreeStore
   (-lock-free? [_] true))
+
+(defn assoc-type-handlers
+  "Transparently attach/replace the buffer type-handler `registry` on a connected
+   LMDB `store` (post-connect, no reconnect). See `PAssocTypeHandlers`. Use this to
+   wire custom-type serialization (e.g. datahike PSS node handlers) onto an LMDB
+   store you did not connect yourself — such as a tiered-store frontend."
+  [store registry]
+  (-assoc-type-handlers store registry))
 
 ;;; Store creation
 
