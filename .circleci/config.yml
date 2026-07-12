@@ -13,8 +13,9 @@ jobs:
   unittest:
     executor: java22
     steps:
-      - attach_workspace:
-          at: /home/circleci
+      - checkout
+      - restore_cache:
+          key: deps-{{ checksum "deps.edn" }}
       - run:
           name: Install Clojure CLI and liblmdb
           command: |
@@ -25,7 +26,11 @@ jobs:
             sudo apt-get install -y liblmdb0
       - run:
           name: Run tests
-          command: clojure -M:test
+          command: |
+            set -o pipefail                       # keep kaocha's exit code through the pipe
+            clojure -M:test 2>&1 | tee /tmp/test.out
+            # Guard against a false green (e.g. a REPL from a missing alias): require assertions.
+            grep -Eq "[1-9][0-9]* assertions" /tmp/test.out
           no_output_timeout: 5m
       - save_cache:
           key: deps-{{ checksum "deps.edn" }}
