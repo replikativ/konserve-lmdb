@@ -41,32 +41,67 @@
 ;; Pool of reusable direct ByteBuffers
 (defonce ^ConcurrentLinkedDeque buffer-pool (ConcurrentLinkedDeque.))
 
-(defn get-buffer
-  "Get a direct ByteBuffer of at least min-size bytes.
-   Tries to reuse from pool, otherwise allocates new.
-   Caller must call return-buffer when done.
+(def ^:const +pool-max-buffers+
+  "Cap on pooled buffer instances, so a leak or a hot loop cannot grow the pool without bound."
+  64)
 
-   Thread-safe: checks .remove() return value to avoid race conditions
-   where two threads could get the same buffer."
+(def ^:const +pool-scan-limit+
+  "How many too-small buffers to pull aside while looking for one big enough."
+  16)
+
+(defn get-buffer
+  "Get a direct ByteBuffer of at least min-size bytes, taking EXCLUSIVE ownership of it.
+   Caller must call return-buffer exactly once when done.
+
+   Takes buffers with `.poll` — never `.remove`. The old code scanned the deque and called
+   `(.remove buffer-pool bf)`, treating a `true` return as 'I have exclusive ownership of bf'.
+   It does not mean that: `remove(Object)` deletes the first element `.equals` to the argument,
+   and `ByteBuffer.equals` compares CONTENTS. So it could delete a DIFFERENT, content-equal
+   buffer, return true, and hand back `bf` — which was still in the pool, and which another
+   thread could poll at the same moment. Two threads then encode into the same direct buffer and
+   the mangled bytes go to LMDB silently: no crash, no exception, just corrupt values.
+
+   `.poll` removes and returns the head atomically, which is ownership by identity — the only
+   thing a pool can actually rely on."
   ^ByteBuffer [^long min-size]
   (let [size (max min-size +default-buffer-size+)]
-    (or (some (fn [^ByteBuffer bf]
-                (when (and (>= (.capacity bf) size)
-                           (.remove buffer-pool bf))  ; Only use if we successfully removed it
-                  (.clear bf)
-                  bf))
-              buffer-pool)
-        (ByteBuffer/allocateDirect size))))
+    (loop [set-aside nil
+           scanned 0]
+      (let [^ByteBuffer bf (.poll buffer-pool)]
+        (cond
+          ;; pool exhausted (or scan budget spent) — allocate, and put back what we pulled aside
+          (or (nil? bf) (>= scanned +pool-scan-limit+))
+          (let [keep (cond-> set-aside bf (conj bf))]
+            (doseq [^ByteBuffer b keep]
+              (.offer buffer-pool b))
+            (ByteBuffer/allocateDirect size))
+
+          (>= (.capacity bf) size)
+          (do (doseq [^ByteBuffer b set-aside]
+                (.offer buffer-pool b))
+              (.clear bf)
+              bf)
+
+          :else
+          (recur (conj (or set-aside []) bf) (inc scanned)))))))
 
 (defn return-buffer
-  "Return a buffer to the pool for reuse.
-   Only pools buffers up to +max-buffer-size+."
+  "Return a buffer to the pool for reuse. Call EXACTLY ONCE per get-buffer.
+
+   Returning the same instance twice would put it in the deque twice, and two callers could then
+   each poll a reference to it — reintroducing the aliasing get-buffer exists to prevent. Both
+   call sites in this namespace are strict `(let [buf (get-buffer n)] (try ... (finally
+   (return-buffer buf))))`, so that cannot happen; the contract is stated rather than enforced
+   because guarding it needs an identity set, and a lock on this path costs real throughput."
   [^ByteBuffer buf]
-  (when (and buf (<= (.capacity buf) +max-buffer-size+))
+  (when (and buf
+             (<= (.capacity buf) +max-buffer-size+)
+             (< (.size buffer-pool) +pool-max-buffers+))
     (.offer buffer-pool buf)))
 
 (defn clear-pool!
-  "Clear all pooled buffers. Useful for testing."
+  "Clear all pooled buffers. Useful for testing.
+"
   []
   (.clear buffer-pool))
 

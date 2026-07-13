@@ -10,7 +10,9 @@
             [coffi.ffi :as ffi])
   (:import [java.lang.foreign MemorySegment ValueLayout Arena]
            [java.nio ByteBuffer ByteOrder]
-           [java.util.concurrent ConcurrentLinkedDeque]))
+           [java.util.concurrent ConcurrentLinkedDeque]
+           [java.util.concurrent.atomic AtomicBoolean AtomicLong]
+           [java.util.concurrent.locks LockSupport]))
 
 (set! *warn-on-reflection* true)
 
@@ -214,9 +216,67 @@
 
 ;; LMDBEnv includes per-env pools to avoid cross-env use-after-free issues.
 ;; When an env is closed, its pools become unreachable and GC'd together.
-(defrecord LMDBEnv [env-ptr dbi arena mdb-val-pool ptr-pool])
+;;
+;; `closed?` + `rw-lock` make close SAFE against in-flight work. `mdb_env_close` munmaps the
+;; data file and frees the MDB_env; LMDB's own docs are blunt about it:
+;;
+;;   "All transactions, databases, and cursors must already be closed before calling this
+;;    function. Attempts to use any such handles after calling this function will cause a
+;;    SIGSEGV."
+;;
+;; A caller cannot honour that on our behalf: konserve's tiered read-through warm is
+;; deliberately fire-and-forget, so writes are still in flight when the store is released. So
+;; the env enforces it — every native op holds the READ lock for the whole call, and close takes
+;; the WRITE lock, which cannot be granted until the last op has finished. (Measured before this
+;; existed: a single store with unawaited async writes, closed once, SIGSEGV'd 5/5 in
+;; mdb_txn_commit; awaiting the writes first, 0/5.)
+;;
+;; Deliberately a counter and a flag, NOT a lock. This is the hot path of every LMDB call, and a
+;; fair ReentrantReadWriteLock costs ~30% of konserve-level throughput (measured) because it
+;; queues every acquisition. Two atomics cost nothing against a native transaction.
+(defrecord LMDBEnv [env-ptr dbi arena mdb-val-pool ptr-pool closed? in-flight])
 
 (def ^:const +pool-max-size+ 64)
+
+(defn env-closed?
+  "Has this env been closed? Ops on a closed env throw rather than call into freed memory."
+  [{:keys [^AtomicBoolean closed?]}]
+  (and closed? (.get closed?)))
+
+(defmacro with-env-op
+  "Run `body` against a LIVE env, counted as in-flight for its whole duration.
+
+   `close-env` flips `closed?` and then waits for `in-flight` to reach zero before it calls
+   `mdb_env_close`, so the mapping cannot be torn down while an op is inside `mdb_txn_commit` —
+   that use-after-munmap is what SIGSEGVs the JVM. An op arriving after close throws instead of
+   dereferencing a freed `MDB_env`.
+
+   The flag is re-read AFTER the increment, and that ordering is the whole correctness argument:
+
+     * If we increment before close reads the counter, close sees us and waits. Safe.
+     * If close reads zero and proceeds to free the env, then it must already have set `closed?`
+       (it sets the flag BEFORE draining) — so our re-read sees `true` and we throw without ever
+       touching the env. Safe.
+
+   Both writes are atomic, so one of those two orderings always holds; the pair cannot slip past
+   each other. The cost of the conservative case is a spurious exception on an env that is being
+   closed anyway.
+
+   Hold this across the WHOLE transaction (begin → commit/abort), never just the begin."
+  [env & body]
+  `(let [env# ~env
+         ^AtomicBoolean closed# (:closed? env#)
+         ^AtomicLong in-flight# (:in-flight env#)]
+     (when (.get closed#)
+       (throw (ex-info "LMDB environment is closed" {:type :konserve-lmdb/env-closed})))
+     (.incrementAndGet in-flight#)
+     (try
+       ;; re-check AFTER announcing ourselves — see the ordering argument above
+       (when (.get closed#)
+         (throw (ex-info "LMDB environment is closed" {:type :konserve-lmdb/env-closed})))
+       ~@body
+       (finally
+         (.decrementAndGet in-flight#)))))
 
 (defn- get-pooled-mdb-val
   "Get an MDB_val struct from env's pool or allocate new."
@@ -317,7 +377,17 @@
                 flags 0}}]
   (let [arena (mem/shared-arena)
         env-ptr-holder (mem/alloc-instance ::mem/pointer arena)
-        read-only? (pos? (bit-and flags MDB_RDONLY))]
+        read-only? (pos? (bit-and flags MDB_RDONLY))
+        ;; MDB_NOTLS, always. Without it LMDB parks each read transaction's lock-table slot in
+        ;; THREAD-LOCAL storage: "Starting a read-only transaction normally ties a lock table
+        ;; slot to the current thread until the environment closes or the thread exits", and the
+        ;; table holds only 126 slots by default. We run on core.async's dispatch pool and on
+        ;; arbitrary caller threads, so slots would be pinned by threads that never touch LMDB
+        ;; again, until the process eventually hits MDB_READERS_FULL. NOTLS ties the slot to the
+        ;; transaction instead of the thread, which is what a thread-pooled caller needs — and it
+        ;; is what makes the exported zero-copy read API (with-read-txn / get-segment) safe to
+        ;; hold across a go-block park. It costs nothing.
+        flags (bit-or flags MDB_NOTLS)]
     (check-rc (mdb-env-create env-ptr-holder) "mdb_env_create")
     (let [env-ptr (mem/read-address env-ptr-holder 0)]
       (check-rc (mdb-env-set-mapsize env-ptr map-size) "mdb_env_set_mapsize")
@@ -338,12 +408,31 @@
             ;; Create per-env pools to avoid cross-env use-after-free
             (->LMDBEnv env-ptr dbi arena
                        (ConcurrentLinkedDeque.)
-                       (ConcurrentLinkedDeque.))))))))
+                       (ConcurrentLinkedDeque.)
+                       (AtomicBoolean. false)
+                       (AtomicLong. 0))))))))
 
 (defn close-env
-  "Close an LMDB environment."
-  [{:keys [env-ptr]}]
-  (mdb-env-close env-ptr))
+  "Close an LMDB environment. IDEMPOTENT, and it DRAINS in-flight operations first.
+
+   `mdb_env_close` munmaps the data file and frees the `MDB_env`. Anything still inside a
+   transaction then writes through a dangling `env->me_map` — which is a SIGSEGV (SEGV_MAPERR),
+   not an exception. Callers cannot prevent that for us: konserve's tiered read-through warm is
+   deliberately fire-and-forget, so writes are still running when the store is released.
+
+   So: flip the closed flag FIRST (late arrivals now throw), then wait for every op already
+   inside to finish, and only then close. The compare-and-set also makes a double release
+   harmless, instead of a second `mdb_env_close` on a freed env.
+
+   Setting the flag before draining is what bounds the wait: no new op can join, so the counter
+   is monotonically falling. Ops are native LMDB calls, so this is a short park, not a spin."
+  [{:keys [env-ptr ^AtomicBoolean closed? ^AtomicLong in-flight]}]
+  (when (.compareAndSet closed? false true)
+    (loop []
+      (when (pos? (.get in-flight))
+        (LockSupport/parkNanos 50000)   ; 50µs
+        (recur)))
+    (mdb-env-close env-ptr)))
 
 (defn env-sync
   "Force sync environment to disk."
@@ -384,14 +473,26 @@
        (let [old-val (get-in-txn txn key-bytes decode-fn)]
          (put-in-txn txn key-bytes (encode new-val))))"
   [[txn-sym env] & body]
-  `(let [~txn-sym (begin-write-txn ~env)]
-     (try
-       (let [result# (do ~@body)]
-         (commit-write-txn ~txn-sym)
-         result#)
-       (catch Throwable t#
-         (abort-write-txn ~txn-sym)
-         (throw t#)))))
+  ;; The read lock spans the WHOLE transaction, not just the begin: close must not be able to
+  ;; munmap between our begin and our commit.
+  ;;
+  ;; `consumed?` is set BEFORE the commit call, not after. mdb_txn_commit FREES THE TRANSACTION
+  ;; HANDLE WHETHER IT SUCCEEDS OR FAILS ("The transaction handle is freed... it and its cursors
+  ;; must not be used again after this call") — and it can fail: MDB_MAP_FULL, ENOSPC, EIO.
+  ;; check-rc turns that into a throw, which used to land in the catch below and call
+  ;; mdb_txn_abort on the freed handle. That double-free unlocks LMDB's writer mutex a second
+  ;; time, so two threads run write transactions at once and corrupt the page allocator.
+  `(with-env-op ~env
+     (let [~txn-sym (begin-write-txn ~env)
+           consumed?# (volatile! false)]
+       (try
+         (let [result# (do ~@body)]
+           (vreset! consumed?# true)
+           (commit-write-txn ~txn-sym)
+           result#)
+         (catch Throwable t#
+           (when-not @consumed?# (abort-write-txn ~txn-sym))
+           (throw t#))))))
 
 (defn get-in-txn
   "Get value within a transaction (read or write). Returns byte array or nil."
@@ -463,178 +564,193 @@
 (defn lmdb-get
   "Get a value by key. Returns byte array or nil if not found."
   [{:keys [env-ptr dbi] :as env} ^bytes key-bytes]
-  (let [txn-ptr-holder (get-pooled-ptr env)]
-    (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
-    (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-      (return-pooled-ptr env txn-ptr-holder)
-      ;; Use confined arena for data - freed when scope exits
-      (with-open [scratch (Arena/ofConfined)]
-        (try
-          (let [key-val (get-pooled-mdb-val env)
-                _ (fill-mdb-val scratch key-val key-bytes)
-                data-val (get-pooled-mdb-val env)
-                rc (mdb-get txn-ptr dbi key-val data-val)
-                result (cond
-                         (zero? rc) (read-mdb-val data-val)
-                         (= rc MDB_NOTFOUND) nil
-                         :else (check-rc rc "mdb_get"))]
-            (return-pooled-mdb-val env key-val)
-            (return-pooled-mdb-val env data-val)
-            result)
-          (finally
-            (mdb-txn-abort txn-ptr)))))))
-
-(defn lmdb-get-decode
-  "Get and decode a value by key in a single transaction. Zero-copy decode.
-   decode-fn takes a ByteBuffer and returns the decoded value.
-   Returns nil if not found."
-  [{:keys [env-ptr dbi] :as env} ^bytes key-bytes decode-fn]
-  (let [txn-ptr-holder (get-pooled-ptr env)]
-    (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
-    (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-      (return-pooled-ptr env txn-ptr-holder)
-      ;; Use confined arena for data - freed when scope exits
-      (with-open [scratch (Arena/ofConfined)]
-        (try
-          (let [key-val (get-pooled-mdb-val env)
-                _ (fill-mdb-val scratch key-val key-bytes)
-                data-val (get-pooled-mdb-val env)
-                rc (mdb-get txn-ptr dbi key-val data-val)
-                result (cond
-                         (zero? rc)
-                         (when-let [[size seg] (read-mdb-val-segment data-val)]
-                           (decode-fn (segment->byte-buffer seg size)))
-                         (= rc MDB_NOTFOUND) nil
-                         :else (check-rc rc "mdb_get"))]
-            (return-pooled-mdb-val env key-val)
-            (return-pooled-mdb-val env data-val)
-            result)
-          (finally
-            (mdb-txn-abort txn-ptr)))))))
-
-(defn lmdb-put
-  "Put a key-value pair."
-  [{:keys [env-ptr dbi] :as env} ^bytes key-bytes ^bytes val-bytes]
-  (let [txn-ptr-holder (get-pooled-ptr env)]
-    (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
-    (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-      (return-pooled-ptr env txn-ptr-holder)
-      ;; Use confined arena for data - freed when scope exits
-      (with-open [scratch (Arena/ofConfined)]
-        (try
-          (let [key-val (get-pooled-mdb-val env)
-                _ (fill-mdb-val scratch key-val key-bytes)
-                data-val (get-pooled-mdb-val env)
-                _ (fill-mdb-val scratch data-val val-bytes)]
-            (check-rc (mdb-put txn-ptr dbi key-val data-val 0) "mdb_put")
-            (return-pooled-mdb-val env key-val)
-            (return-pooled-mdb-val env data-val)
-            (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit"))
-          (catch Throwable t
-            (mdb-txn-abort txn-ptr)
-            (throw t)))))))
-
-(defn lmdb-del
-  "Delete a key."
-  [{:keys [env-ptr dbi] :as env} ^bytes key-bytes]
-  (let [txn-ptr-holder (get-pooled-ptr env)]
-    (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
-    (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-      (return-pooled-ptr env txn-ptr-holder)
-      ;; Use confined arena for data - freed when scope exits
-      (with-open [scratch (Arena/ofConfined)]
-        (try
-          (let [key-val (get-pooled-mdb-val env)
-                _ (fill-mdb-val scratch key-val key-bytes)
-                rc (mdb-del txn-ptr dbi key-val nil)]
-            (return-pooled-mdb-val env key-val)
-            (when (and (not (zero? rc)) (not= rc MDB_NOTFOUND))
-              (check-rc rc "mdb_del"))
-            (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit")
-            (zero? rc))
-          (catch Throwable t
-            (mdb-txn-abort txn-ptr)
-            (throw t)))))))
-
-(defn lmdb-keys
-  "Return all keys in the database as a vector of byte arrays."
-  [{:keys [env-ptr dbi arena]}]
-  ;; lmdb-keys uses direct arena allocation (not pooled) because the MDB_vals
-  ;; are reused across the cursor loop and need stable memory for the iteration.
-  (let [txn-ptr-holder (mem/alloc-instance ::mem/pointer arena)]
-    (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
-    (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-      (try
-        (let [cursor-holder (mem/alloc-instance ::mem/pointer arena)]
-          (check-rc (mdb-cursor-open txn-ptr dbi cursor-holder) "mdb_cursor_open")
-          (let [cursor-ptr (mem/read-address cursor-holder 0)
-                key-val (mem/alloc-instance MDB_val arena)
-                data-val (mem/alloc-instance MDB_val arena)]
-            (try
-              (loop [keys []
-                     op MDB_FIRST]
-                (let [rc (mdb-cursor-get cursor-ptr key-val data-val op)]
-                  (if (zero? rc)
-                    (recur (conj keys (read-mdb-val key-val)) MDB_NEXT)
-                    keys)))
-              (finally
-                (mdb-cursor-close cursor-ptr)))))
-        (finally
-          (mdb-txn-abort txn-ptr))))))
-
-(defn lmdb-multi-get
-  "Get multiple values by keys. Returns map of key-bytes -> val-bytes.
-   Only includes keys that were found."
-  [{:keys [env-ptr dbi] :as env} keys-bytes]
-  (if (empty? keys-bytes)
-    {}
+  (with-env-op env
     (let [txn-ptr-holder (get-pooled-ptr env)]
       (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
       (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
         (return-pooled-ptr env txn-ptr-holder)
-        ;; Use confined arena for all key data in this batch - freed when scope exits
+        ;; Use confined arena for data - freed when scope exits
         (with-open [scratch (Arena/ofConfined)]
           (try
             (let [key-val (get-pooled-mdb-val env)
+                  _ (fill-mdb-val scratch key-val key-bytes)
                   data-val (get-pooled-mdb-val env)
-                  result (reduce (fn [acc key-bytes]
-                                   (fill-mdb-val scratch key-val key-bytes)
-                                   (let [rc (mdb-get txn-ptr dbi key-val data-val)]
-                                     (if (zero? rc)
-                                       (assoc acc key-bytes (read-mdb-val data-val))
-                                       acc)))
-                                 {}
-                                 keys-bytes)]
+                  rc (mdb-get txn-ptr dbi key-val data-val)
+                  result (cond
+                           (zero? rc) (read-mdb-val data-val)
+                           (= rc MDB_NOTFOUND) nil
+                           :else (check-rc rc "mdb_get"))]
               (return-pooled-mdb-val env key-val)
               (return-pooled-mdb-val env data-val)
               result)
             (finally
               (mdb-txn-abort txn-ptr))))))))
 
+(defn lmdb-get-decode
+  "Get and decode a value by key in a single transaction. Zero-copy decode.
+   decode-fn takes a ByteBuffer and returns the decoded value.
+   Returns nil if not found."
+  [{:keys [env-ptr dbi] :as env} ^bytes key-bytes decode-fn]
+  (with-env-op env
+    (let [txn-ptr-holder (get-pooled-ptr env)]
+      (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
+      (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
+        (return-pooled-ptr env txn-ptr-holder)
+        ;; Use confined arena for data - freed when scope exits
+        (with-open [scratch (Arena/ofConfined)]
+          (try
+            (let [key-val (get-pooled-mdb-val env)
+                  _ (fill-mdb-val scratch key-val key-bytes)
+                  data-val (get-pooled-mdb-val env)
+                  rc (mdb-get txn-ptr dbi key-val data-val)
+                  result (cond
+                           (zero? rc)
+                           (when-let [[size seg] (read-mdb-val-segment data-val)]
+                             (decode-fn (segment->byte-buffer seg size)))
+                           (= rc MDB_NOTFOUND) nil
+                           :else (check-rc rc "mdb_get"))]
+              (return-pooled-mdb-val env key-val)
+              (return-pooled-mdb-val env data-val)
+              result)
+            (finally
+              (mdb-txn-abort txn-ptr))))))))
+
+(defn lmdb-put
+  "Put a key-value pair."
+  [{:keys [env-ptr dbi] :as env} ^bytes key-bytes ^bytes val-bytes]
+  (with-env-op env
+    (let [txn-ptr-holder (get-pooled-ptr env)]
+      (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
+      (let [txn-ptr (mem/read-address txn-ptr-holder 0)
+            ;; set BEFORE the commit call: mdb_txn_commit frees the handle even when it FAILS,
+            ;; so aborting after a failed commit is a double-free (see with-write-txn).
+            consumed? (volatile! false)]
+        (return-pooled-ptr env txn-ptr-holder)
+        ;; Use confined arena for data - freed when scope exits
+        (with-open [scratch (Arena/ofConfined)]
+          (try
+            (let [key-val (get-pooled-mdb-val env)
+                  _ (fill-mdb-val scratch key-val key-bytes)
+                  data-val (get-pooled-mdb-val env)
+                  _ (fill-mdb-val scratch data-val val-bytes)]
+              (check-rc (mdb-put txn-ptr dbi key-val data-val 0) "mdb_put")
+              (return-pooled-mdb-val env key-val)
+              (return-pooled-mdb-val env data-val)
+              (vreset! consumed? true)
+              (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit"))
+            (catch Throwable t
+              (when-not @consumed? (mdb-txn-abort txn-ptr))
+              (throw t))))))))
+
+(defn lmdb-del
+  "Delete a key."
+  [{:keys [env-ptr dbi] :as env} ^bytes key-bytes]
+  (with-env-op env
+    (let [txn-ptr-holder (get-pooled-ptr env)]
+      (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
+      (let [txn-ptr (mem/read-address txn-ptr-holder 0)
+            consumed? (volatile! false)]
+        (return-pooled-ptr env txn-ptr-holder)
+        ;; Use confined arena for data - freed when scope exits
+        (with-open [scratch (Arena/ofConfined)]
+          (try
+            (let [key-val (get-pooled-mdb-val env)
+                  _ (fill-mdb-val scratch key-val key-bytes)
+                  rc (mdb-del txn-ptr dbi key-val nil)]
+              (return-pooled-mdb-val env key-val)
+              (when (and (not (zero? rc)) (not= rc MDB_NOTFOUND))
+                (check-rc rc "mdb_del"))
+              (vreset! consumed? true)
+              (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit")
+              (zero? rc))
+            (catch Throwable t
+              (when-not @consumed? (mdb-txn-abort txn-ptr))
+              (throw t))))))))
+
+(defn lmdb-keys
+  "Return all keys in the database as a vector of byte arrays."
+  [{:keys [env-ptr dbi arena] :as env}]
+  (with-env-op env
+    ;; lmdb-keys uses direct arena allocation (not pooled) because the MDB_vals
+    ;; are reused across the cursor loop and need stable memory for the iteration.
+    (let [txn-ptr-holder (mem/alloc-instance ::mem/pointer arena)]
+      (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
+      (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
+        (try
+          (let [cursor-holder (mem/alloc-instance ::mem/pointer arena)]
+            (check-rc (mdb-cursor-open txn-ptr dbi cursor-holder) "mdb_cursor_open")
+            (let [cursor-ptr (mem/read-address cursor-holder 0)
+                  key-val (mem/alloc-instance MDB_val arena)
+                  data-val (mem/alloc-instance MDB_val arena)]
+              (try
+                (loop [keys []
+                       op MDB_FIRST]
+                  (let [rc (mdb-cursor-get cursor-ptr key-val data-val op)]
+                    (if (zero? rc)
+                      (recur (conj keys (read-mdb-val key-val)) MDB_NEXT)
+                      keys)))
+                (finally
+                  (mdb-cursor-close cursor-ptr)))))
+          (finally
+            (mdb-txn-abort txn-ptr)))))))
+
+(defn lmdb-multi-get
+  "Get multiple values by keys. Returns map of key-bytes -> val-bytes.
+   Only includes keys that were found."
+  [{:keys [env-ptr dbi] :as env} keys-bytes]
+  (with-env-op env
+    (if (empty? keys-bytes)
+      {}
+      (let [txn-ptr-holder (get-pooled-ptr env)]
+        (check-rc (mdb-txn-begin env-ptr nil MDB_RDONLY txn-ptr-holder) "mdb_txn_begin")
+        (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
+          (return-pooled-ptr env txn-ptr-holder)
+          ;; Use confined arena for all key data in this batch - freed when scope exits
+          (with-open [scratch (Arena/ofConfined)]
+            (try
+              (let [key-val (get-pooled-mdb-val env)
+                    data-val (get-pooled-mdb-val env)
+                    result (reduce (fn [acc key-bytes]
+                                     (fill-mdb-val scratch key-val key-bytes)
+                                     (let [rc (mdb-get txn-ptr dbi key-val data-val)]
+                                       (if (zero? rc)
+                                         (assoc acc key-bytes (read-mdb-val data-val))
+                                         acc)))
+                                   {}
+                                   keys-bytes)]
+                (return-pooled-mdb-val env key-val)
+                (return-pooled-mdb-val env data-val)
+                result)
+              (finally
+                (mdb-txn-abort txn-ptr)))))))))
+
 (defn lmdb-multi-put
   "Put multiple key-value pairs in a single transaction.
    kv-pairs is a sequence of [key-bytes val-bytes] pairs."
   [{:keys [env-ptr dbi] :as env} kv-pairs]
   (when (seq kv-pairs)
-    (let [txn-ptr-holder (get-pooled-ptr env)]
-      (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
-      (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-        (return-pooled-ptr env txn-ptr-holder)
-        ;; Use confined arena for all key/value data in this batch - freed when scope exits
-        (with-open [scratch (Arena/ofConfined)]
-          (try
-            (let [key-val (get-pooled-mdb-val env)
-                  data-val (get-pooled-mdb-val env)]
-              (doseq [[key-bytes val-bytes] kv-pairs]
-                (fill-mdb-val scratch key-val key-bytes)
-                (fill-mdb-val scratch data-val val-bytes)
-                (check-rc (mdb-put txn-ptr dbi key-val data-val 0) "mdb_put"))
-              (return-pooled-mdb-val env key-val)
-              (return-pooled-mdb-val env data-val))
-            (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit")
-            (catch Throwable t
-              (mdb-txn-abort txn-ptr)
-              (throw t))))))))
+    (with-env-op env
+      (let [txn-ptr-holder (get-pooled-ptr env)]
+        (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
+        (let [txn-ptr (mem/read-address txn-ptr-holder 0)
+              consumed? (volatile! false)]
+          (return-pooled-ptr env txn-ptr-holder)
+          ;; Use confined arena for all key/value data in this batch - freed when scope exits
+          (with-open [scratch (Arena/ofConfined)]
+            (try
+              (let [key-val (get-pooled-mdb-val env)
+                    data-val (get-pooled-mdb-val env)]
+                (doseq [[key-bytes val-bytes] kv-pairs]
+                  (fill-mdb-val scratch key-val key-bytes)
+                  (fill-mdb-val scratch data-val val-bytes)
+                  (check-rc (mdb-put txn-ptr dbi key-val data-val 0) "mdb_put"))
+                (return-pooled-mdb-val env key-val)
+                (return-pooled-mdb-val env data-val))
+              (vreset! consumed? true)
+              (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit")
+              (catch Throwable t
+                (when-not @consumed? (mdb-txn-abort txn-ptr))
+                (throw t)))))))))
 
 (defn lmdb-multi-del
   "Delete multiple keys in a single transaction.
@@ -642,24 +758,27 @@
   [{:keys [env-ptr dbi] :as env} keys-bytes]
   (if (empty? keys-bytes)
     {}
-    (let [txn-ptr-holder (get-pooled-ptr env)]
-      (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
-      (let [txn-ptr (mem/read-address txn-ptr-holder 0)]
-        (return-pooled-ptr env txn-ptr-holder)
-        ;; Use confined arena for all key data in this batch - freed when scope exits
-        (with-open [scratch (Arena/ofConfined)]
-          (try
-            (let [results (reduce (fn [acc key-bytes]
-                                    (let [key-val (make-mdb-val scratch key-bytes)
-                                          rc (mdb-del txn-ptr dbi key-val nil)]
-                                      (assoc acc key-bytes (zero? rc))))
-                                  {}
-                                  keys-bytes)]
-              (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit")
-              results)
-            (catch Throwable t
-              (mdb-txn-abort txn-ptr)
-              (throw t))))))))
+    (with-env-op env
+      (let [txn-ptr-holder (get-pooled-ptr env)]
+        (check-rc (mdb-txn-begin env-ptr nil 0 txn-ptr-holder) "mdb_txn_begin")
+        (let [txn-ptr (mem/read-address txn-ptr-holder 0)
+              consumed? (volatile! false)]
+          (return-pooled-ptr env txn-ptr-holder)
+          ;; Use confined arena for all key data in this batch - freed when scope exits
+          (with-open [scratch (Arena/ofConfined)]
+            (try
+              (let [results (reduce (fn [acc key-bytes]
+                                      (let [key-val (make-mdb-val scratch key-bytes)
+                                            rc (mdb-del txn-ptr dbi key-val nil)]
+                                        (assoc acc key-bytes (zero? rc))))
+                                    {}
+                                    keys-bytes)]
+                (vreset! consumed? true)
+                (check-rc (mdb-txn-commit txn-ptr) "mdb_txn_commit")
+                results)
+              (catch Throwable t
+                (when-not @consumed? (mdb-txn-abort txn-ptr))
+                (throw t)))))))))
 
 (comment
   ;; Usage example
